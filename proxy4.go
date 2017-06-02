@@ -148,7 +148,7 @@ func debugCache() {
 	fmt.Printf("length of cache map is: %d\n", len(cacheMap))
 	
 	for e := cacheList.Front(); e != nil; e = e.Next() {
-	// do something with e.Value
+		// double checking
 		fmt.Printf("%d\n", e.Value.(*node).url)
 	}
 	
@@ -185,7 +185,6 @@ func handleUrl(url string, host string, channels chan bool) {
 	}
 
 	host = getHost(urlString)
-	// fmt.Println(host)
 
 	ipQuery := host + ":80"
 
@@ -204,7 +203,6 @@ func handleUrl(url string, host string, channels chan bool) {
 
 		if (uint(diff.Seconds()) < cacheTimeout) {
 		   	//move node to front of list
-		   	// TODO: double check with cody about this
 		   	cacheLock.Lock()
 		   	cacheList.MoveToFront(val)
 		   	cacheLock.Unlock()
@@ -213,7 +211,6 @@ func handleUrl(url string, host string, channels chan bool) {
 		   	statLock.Unlock()
 
 		    <-channels
-		    // fmt.Println("is it returning here?")
 		    return
 		} else {
 		   	//conditional GET
@@ -221,7 +218,6 @@ func handleUrl(url string, host string, channels chan bool) {
 		    modifiedTime := cacheNode.cacheTime.UTC()
 		    timeString := modifiedTime.Format("Mon, 02 Jan 2006 15:04:05 GMT")
 		    
-		    // conn.Write([]byte("GET " + getPath(urlString) + " HTTP/1.1\r\n"))
 		    req, err := http.NewRequest("GET", urlString, nil)
 			if err != nil {
 				fmt.Printf("error in creating request: %s\n", err)
@@ -230,15 +226,9 @@ func handleUrl(url string, host string, channels chan bool) {
 		    req.Header.Set("Connection", "close")
 		    req.Header.Set("Accept-Encoding", "gzip")
 		    req.Header.Set("Host", host)
-		    req.Write(conn)
-		    // conn.Write([]byte("\r\n\r\n"))
+		    req.Write(conn)		    
 		}
    	} else {
-   		// fmt.Println("is it here?")
-   		// fmt.Println("nonconditional?")
-   		// fmt.Println(getPath(urlString))
-
-   		// conn.Write([]byte("GET " + getPath(urlString) + " HTTP/1.1\r\n"))
 		req, err := http.NewRequest("GET", urlString, nil)
 		if err != nil {
 			fmt.Printf("error in creating request: %s\n", err)
@@ -247,7 +237,6 @@ func handleUrl(url string, host string, channels chan bool) {
     	req.Header.Set("Accept-Encoding", "gzip")
     	req.Header.Set("Host", host)
     	req.Write(conn)
-    	// conn.Write([]byte("\r\n\r\n"))
     }
 
     //response time
@@ -262,7 +251,6 @@ func handleUrl(url string, host string, channels chan bool) {
 
     //currently in cache
     if val, ok := cacheMap[urlString]; ok{
-    	// fmt.Println("is it in this if clause?")
     	//check header Cache-Control
     	cacheControlKey := http.CanonicalHeaderKey("Cache-Control")
 		cacheControlArray := header[cacheControlKey]
@@ -318,11 +306,7 @@ func handleUrl(url string, host string, channels chan bool) {
 	} else {
 		cacheControlKey := http.CanonicalHeaderKey("Cache-Control")
 		cacheControlArray := header[cacheControlKey]
-		// fmt.Printf("status code: %d length: %d\n", resp.StatusCode, uint(resp.ContentLength))
-		// fmt.Println(!stringInArray("no-cache", cacheControlArray))
-		// fmt.Println(uint(resp.ContentLength) < maxObjSize)
-		// fmt.Println(resp.StatusCode)
-		// fmt.Println(resp.StatusCode == 200)
+
     	if (!stringInArray("no-cache", cacheControlArray) && uint(resp.ContentLength) < maxObjSize && resp.StatusCode == 200) {
     		//insert into hashtable, list
 			newNode := node{url: urlString, response: resp, cacheTime: currTime}
@@ -370,14 +354,13 @@ func doLinkPrefetching (doc *html.Node, host string) {
 	channels := make(chan bool, maxConcurrency)
 	for _, url := range urls {
 	   channels <- true
-	   // fmt.Printf("prefetched %s\n", url)
+
 	   go handleUrl(url, host, channels)
 	}
 }
 
 func doDnsPrefetching (doc *html.Node, host string) {
 	urls := parse(doc)
-	// fmt.Println(urls)
 
 	for _, url := range urls {
 		fmt.Println(url)
@@ -388,7 +371,6 @@ func doDnsPrefetching (doc *html.Node, host string) {
 				fmt.Println("ERRRORRRR IN DNSSS PREFETCHINGGG")
 			}
 		} else {
-			// hostStr := getHost(url)
 			_, err := net.LookupHost(host)
 			if err != nil {
 				fmt.Println("ERRRORRRR IN DNSSS PREFETCHINGGG")
@@ -399,13 +381,12 @@ func doDnsPrefetching (doc *html.Node, host string) {
 
 func handleRequest(w net.Conn) {
 	defer w.Close()
-	// fmt.Println("entering handleRequest\n")
 
 	reader := bufio.NewReader(w)
 	req, err := http.ReadRequest(reader)
 	if err != nil {
      	fmt.Println("Error in request")
-		fmt.Fprintf(w, Server_Message) // TODO: we should define Server_Message later
+		fmt.Fprintf(w, Server_Message)
 		return
     }
     statLock.Lock()
@@ -415,13 +396,12 @@ func handleRequest(w net.Conn) {
     method := req.Method
     url := req.URL
     urlString := url.String()
-    // fmt.Printf("urlString is: %s\n", urlString)
     if (!strings.HasSuffix(urlString, "/")) {
     	urlString += "/"
     }
     header := req.Header
     var portNum string
-    // copied from previous proxy
+
     host := req.Host
     if !strings.Contains(host, ":") {
        portNum = ":80"
@@ -438,22 +418,19 @@ func handleRequest(w net.Conn) {
     	fmt.Fprintf(w, Server_Message)
     	return
     }
-    // fmt.Println("After all checking\n")
+   
     if (caching) {
-    	// fmt.Println("caching is on\n")
     	if val, ok := cacheMap[urlString]; ok {
     		currentTime := time.Now()
     		diff := currentTime.Sub(val.Value.(*node).cacheTime)
     		if (uint(diff.Seconds()) < cacheTimeout) {
     			//move node to front of list
-    			// TODO: double check with cody about this
     			cacheLock.Lock()
     			cacheList.MoveToFront(val)
     			cacheLock.Unlock()
 	    		//send what is in the body
 	    		cacheResponse := val.Value.(*node).response
 	    		defer cacheResponse.Body.Close()
-	    		// fmt.Println("writing to output\n")
 				
 				var newReader io.Reader
 				cacheLock.Lock()
@@ -525,22 +502,17 @@ func handleRequest(w net.Conn) {
     defer connDial.Close()
     path := url.Path
     connDial.Write([]byte("GET " + path + " HTTP/1.1\r\n"))
-    // req, err := http.NewRequest("GET", path, nil)
     header.Set("Host", host)
     header.Set("Connection", "close")
     header.Set("Accept-Encoding", "gzip")
     header.Write(connDial)
     connDial.Write([]byte("\r\n\r\n"))
-    // fmt.Println("after dial\n")
     
     bufReader := bufio.NewReader(connDial)
-    // fmt.Println("before response\n")
-    // fmt.Println(req);
     resp, err := http.ReadResponse(bufReader, req)
-    // fmt.Println("after response\n")
     if err != nil {
      	fmt.Println("Error in response")
-		fmt.Fprintf(w, Server_Message) // TODO: define Server_Message
+		fmt.Fprintf(w, Server_Message)
 		return
     }
     defer resp.Body.Close()
@@ -697,7 +669,7 @@ func handleRequest(w net.Conn) {
     }
     cacheLock.Lock()
     if (resp.ContentLength == -1) {
-	    			fmt.Println("fuc")
+	    			fmt.Println("error in content length")
 	    		}
     bodyBytes, err := ioutil.ReadAll(resp.Body)
     if err != nil {
@@ -722,10 +694,7 @@ func handleRequest(w net.Conn) {
 	}
 	cacheLock.Unlock()
 	if resp.StatusCode == 200 {
-		// fmt.Println("dns/link prefetching\n")
-
 		var newReader io.Reader
-		// fmt.Println("writing to output finallll\n")
 		tempReader := bytes.NewReader(bodyBytes)
 
 		encodingKey := http.CanonicalHeaderKey("Content-Encoding")
@@ -772,7 +741,6 @@ func main() {
 	initFlags()
 
 	go saveStatistics()
-	// TODO: Other initializations
 	ln, er := net.Listen("tcp", "0.0.0.0:" + strconv.Itoa(int(listeningPort)))
 	if er != nil {
        fmt.Println("Error in Listen")
@@ -784,24 +752,20 @@ func main() {
     if (linkPrefetching) {
     	caching = true
 	}
-    // I should initialize my cache structures here	
     if (caching) {
     	// doubly-linked list and Map for the LRU cache data-structure
     	cacheMap = make(map[string]*list.Element)
     	cacheList = list.New()
     	cacheSize = 0
     }
-    fmt.Println("hello")
     statLock = &sync.RWMutex{}
     cacheLock = &sync.Mutex{}
 
 	for {
-		// fmt.Println("hi")
 		conn, error := ln.Accept()
 	   	if error != nil {
 	       fmt.Println("Error in Accept")
   	    }
         go handleRequest(conn)
-        // debugCache()
     }
 }
