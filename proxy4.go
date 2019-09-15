@@ -1,49 +1,49 @@
 package main
 
 import (
-	"compress/gzip" // uncomment this line to use the gzip package
+	"bufio"
+	"bytes"
+	"compress/gzip"  // uncomment this line to use the gzip package
+	"container/list" // this is for the list..
 	"flag"
 	"fmt"
-	"golang.org/x/net/html" // uncomment this line to use the html package
+	"io"
+	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
-	"strings"
-	"bufio"
-	"container/list" // this is for the list..
-	"io"
-	"strconv" 
-	"io/ioutil"
-	"bytes"
+
+	"golang.org/x/net/html" // uncomment this line to use the html package
 )
 
 const EXIT_FAILURE = 1
 const Server_Error = "<html><head>\r\b<title>500 Internal Server Error</title>\r\n</head><body>\r\n<h1>Internal Server Error</h1>\r\n</body></html>\r\n"
 const Server_Message = "HTTP/1.1 500 Internal Server Error\r\n" + "Connection: close\r\n" + "Content-Length: 129\r\n" + "Content-Type: text/html\r\n\r\n" + Server_Error + "\r\n"
 
-
 // Global constants
 const (
-	SERVERROR	= 500
-	BADREQ		= 400
-	MAX_OBJ_SIZE	= 500*1024
-	MAX_CACHE_SIZE	= 10*1024*1024
+	SERVERROR      = 500
+	BADREQ         = 400
+	MAX_OBJ_SIZE   = 500 * 1024
+	MAX_CACHE_SIZE = 10 * 1024 * 1024
 )
 
 // Command line parameters
 var (
-	listeningPort	uint
-	dnsPrefetching	bool
-	caching		bool
-	cacheTimeout	uint
-	maxCacheSize	uint
-	maxObjSize	uint
-	linkPrefetching	bool
-	maxConcurrency	uint
-	outputFile	string
+	listeningPort   uint
+	dnsPrefetching  bool
+	caching         bool
+	cacheTimeout    uint
+	maxCacheSize    uint
+	maxObjSize      uint
+	linkPrefetching bool
+	maxConcurrency  uint
+	outputFile      string
 )
 
 // Channel to synchronize number of prefetch threads
@@ -51,45 +51,46 @@ var semConc chan bool
 
 // structure for the cacheItem, what we will be caching
 type node struct {
-	url string
-	response *http.Response
+	url       string
+	response  *http.Response
 	cacheTime time.Time
 }
 
 // Data structures for the LRU cache implementation
 var (
 	cacheList *list.List
-	cacheMap map[string]*list.Element
- 	cacheSize uint
+	cacheMap  map[string]*list.Element
+	cacheSize uint
 )
 
-// Stat variables
-var (
-	clientRequests	int	// HTTP requests
-	cacheHits	int	// Cache Hits
-	cacheMisses	int	// Cache misses
-	cacheEvictions	int	// Cache evictions
-	trafficSent	int	// Bytes sent to clients
-	volumeFromCache	int	// Bytes sent from the cache
-	downloadVolume	int	// Bytes downloaded from servers
-)
+// stats
+type stats struct {
+	lock            *sync.RWMutex
+	clientRequests  int // HTTP requests
+	cacheHits       int // Cache Hits
+	cacheMisses     int // Cache misses
+	cacheEvictions  int // Cache evictions
+	trafficSent     int // Bytes sent to clients
+	volumeFromCache int // Bytes sent from the cache
+	downloadVolume  int // Bytes downloaded from servers
+}
 
-// RW lock for the stat variables. 
+var proxyStats stats
+
+// RW lock for the stat variables.
 // You need to lock the stat variables when updating them.
-var statLock	*sync.RWMutex
-var cacheLock   *sync.Mutex
+var cacheLock *sync.Mutex
 
 func getPath(url string) string {
 	urlArray := strings.Split(url, "/")
 	path := "/"
-	if len(urlArray) == 3 { 
-		return path
-	} else {
-		for i := 3; i < len(urlArray); i++ {
-			path = path + urlArray[i] + "/"
-		}
+	if len(urlArray) == 3 {
 		return path
 	}
+	for i := 3; i < len(urlArray); i++ {
+		path = path + urlArray[i] + "/"
+	}
+	return path
 }
 func getHost(url string) string {
 	urlArray := strings.Split(url, "/")
@@ -102,65 +103,63 @@ func saveStatistics() {
 	}
 	start := time.Now()
 	str := "#Time(s)\tclientRequests\tcacheHits\tcacheMisses\tcacheEvictions" +
-		"\ttrafficSent\tvolumeFromCache\tdownloadVolume\ttrafficWastage\tcacheEfficiency";
+		"\ttrafficSent\tvolumeFromCache\tdownloadVolume\ttrafficWastage\tcacheEfficiency"
 	f.WriteString(str)
 	for {
-		var cacheEfficiency	float64
-		var trafficWastage	int
-		
+		var cacheEfficiency float64
+		var trafficWastage int
+
 		currentTime := time.Now().Sub(start)
-		statLock.RLock()
-		if trafficSent > 0 {
-			cacheEfficiency = float64(volumeFromCache) / float64(trafficSent)
-		} else {
-			cacheEfficiency = 0.0
+		proxyStats.lock.RLock()
+		if proxyStats.trafficSent > 0 {
+			cacheEfficiency = float64(proxyStats.volumeFromCache) / float64(proxyStats.trafficSent)
 		}
-		if downloadVolume > trafficSent {
-			trafficWastage = downloadVolume-trafficSent
+		if proxyStats.downloadVolume > proxyStats.trafficSent {
+			trafficWastage = proxyStats.downloadVolume - proxyStats.trafficSent
 		} else {
-			trafficWastage = 0;
+			trafficWastage = 0
 		}
-		
-		str := fmt.Sprintf("\n%d\t\t%d\t\t%d\t\t%d\t\t%d\t\t%d\t\t%d\t\t%d\t\t%d\t\t%f",
-			int(currentTime.Seconds()),	clientRequests,
-			cacheHits, cacheMisses, cacheEvictions,
-			trafficSent, volumeFromCache, downloadVolume,
+
+		str := fmt.Sprintf(
+			"\n%d\t\t%d\t\t%d\t\t%d\t\t%d\t\t%d\t\t%d\t\t%d\t\t%d\t\t%f",
+			int(currentTime.Seconds()), proxyStats.clientRequests,
+			proxyStats.cacheHits, proxyStats.cacheMisses, proxyStats.cacheEvictions,
+			proxyStats.trafficSent, proxyStats.volumeFromCache, proxyStats.downloadVolume,
 			trafficWastage, cacheEfficiency)
-		statLock.RUnlock()
+		proxyStats.lock.RUnlock()
 		f.WriteString(str)
 		f.Sync()
-		time.Sleep(time.Second * 10)		
+		time.Sleep(time.Second * 10)
 	}
 }
 
 func stringInArray(key string, list []string) bool {
-    for _, b := range list {
-        if strings.ToLower(b) == strings.ToLower(key) {
-            return true
-        }
-    }
-    return false
+	for _, b := range list {
+		if strings.ToLower(b) == strings.ToLower(key) {
+			return true
+		}
+	}
+	return false
 }
-
 
 func debugCache() {
 	fmt.Printf("length of cache list is: %d\n", cacheList.Len())
 	fmt.Printf("length of cache map is: %d\n", len(cacheMap))
-	
+
 	for e := cacheList.Front(); e != nil; e = e.Next() {
 		// double checking
 		fmt.Printf("%d\n", e.Value.(*node).url)
 	}
-	
+
 }
 
-func parse (n *html.Node) []string {
+func parse(n *html.Node) []string {
 	array := []string{}
-	if (n.Type == html.ElementNode && n.Data == "a") {
+	if n.Type == html.ElementNode && n.Data == "a" {
 		for _, a := range n.Attr {
 			if a.Key == "href" {
-				if (!strings.Contains(a.Val, "https://") && !strings.Contains(a.Val, "ftp://")) {
-					if (strings.Index(a.Val, "http://") == 0 || strings.Index(a.Val, "/") == 0) {
+				if !strings.Contains(a.Val, "https://") && !strings.Contains(a.Val, "ftp://") {
+					if strings.Index(a.Val, "http://") == 0 || strings.Index(a.Val, "/") == 0 {
 						array = append(array, a.Val)
 					}
 				}
@@ -175,12 +174,12 @@ func parse (n *html.Node) []string {
 
 func handleUrl(url string, host string, channels chan bool) {
 	var urlString string
-	if (strings.Contains(url, "http://")) {
+	if strings.Contains(url, "http://") {
 		urlString = url
 	} else {
-		urlString = "http://" + host + url 
+		urlString = "http://" + host + url
 	}
-	if (!strings.HasSuffix(urlString, "/")) {
+	if !strings.HasSuffix(urlString, "/") {
 		urlString += "/"
 	}
 
@@ -201,170 +200,170 @@ func handleUrl(url string, host string, channels chan bool) {
 		cacheNode := val.Value.(*node)
 		diff := currentTime.Sub(cacheNode.cacheTime)
 
-		if (uint(diff.Seconds()) < cacheTimeout) {
-		   	//move node to front of list
-		   	cacheLock.Lock()
-		   	cacheList.MoveToFront(val)
-		   	cacheLock.Unlock()
-		   	statLock.Lock()
-		   	cacheHits++
-		   	statLock.Unlock()
+		if uint(diff.Seconds()) < cacheTimeout {
+			//move node to front of list
+			cacheLock.Lock()
+			cacheList.MoveToFront(val)
+			cacheLock.Unlock()
+			proxyStats.lock.Lock()
+			proxyStats.cacheHits++
+			proxyStats.lock.Unlock()
 
-		    <-channels
-		    return
-		} else {
-		   	//conditional GET
-		    //add to header If-Modified-Since
-		    modifiedTime := cacheNode.cacheTime.UTC()
-		    timeString := modifiedTime.Format("Mon, 02 Jan 2006 15:04:05 GMT")
-		    
-		    req, err := http.NewRequest("GET", urlString, nil)
-			if err != nil {
-				fmt.Printf("error in creating request: %s\n", err)
-			}		
-		    req.Header.Set("If-Modified-Since", timeString)
-		    req.Header.Set("Connection", "close")
-		    req.Header.Set("Accept-Encoding", "gzip")
-		    req.Header.Set("Host", host)
-		    req.Write(conn)		    
+			<-channels
+			return
 		}
-   	} else {
+
+		//conditional GET
+		//add to header If-Modified-Since
+		modifiedTime := cacheNode.cacheTime.UTC()
+		timeString := modifiedTime.Format("Mon, 02 Jan 2006 15:04:05 GMT")
+
 		req, err := http.NewRequest("GET", urlString, nil)
 		if err != nil {
 			fmt.Printf("error in creating request: %s\n", err)
 		}
-    	req.Header.Set("Connection", "close")
-    	req.Header.Set("Accept-Encoding", "gzip")
-    	req.Header.Set("Host", host)
-    	req.Write(conn)
-    }
+		req.Header.Set("If-Modified-Since", timeString)
+		req.Header.Set("Connection", "close")
+		req.Header.Set("Accept-Encoding", "gzip")
+		req.Header.Set("Host", host)
+		req.Write(conn)
+	} else {
+		req, err := http.NewRequest("GET", urlString, nil)
+		if err != nil {
+			fmt.Printf("error in creating request: %s\n", err)
+		}
+		req.Header.Set("Connection", "close")
+		req.Header.Set("Accept-Encoding", "gzip")
+		req.Header.Set("Host", host)
+		req.Write(conn)
+	}
 
-    //response time
-    currTime := time.Now()
-    bufReader := bufio.NewReader(conn)
+	//response time
+	currTime := time.Now()
+	bufReader := bufio.NewReader(conn)
 	resp, err := http.ReadResponse(bufReader, nil)
-	if (err != nil) {
+	if err != nil {
 		fmt.Printf("error in readResponse: %s\n", err)
 		return
 	}
-    header := resp.Header
+	header := resp.Header
 
-    //currently in cache
-    if val, ok := cacheMap[urlString]; ok{
-    	//check header Cache-Control
-    	cacheControlKey := http.CanonicalHeaderKey("Cache-Control")
+	//currently in cache
+	if val, ok := cacheMap[urlString]; ok {
+		//check header Cache-Control
+		cacheControlKey := http.CanonicalHeaderKey("Cache-Control")
 		cacheControlArray := header[cacheControlKey]
 
-		if (stringInArray("no-cache", cacheControlArray)) {
-    		// remove node from list, hashtable
-    		cacheLock.Lock()
-    		cacheList.Remove(val)
-    		delete(cacheMap, urlString)	
-    		cacheLock.Unlock()
-    		statLock.Lock()
-    		cacheEvictions++
-    		statLock.Unlock()
-    	} else if (resp.StatusCode == 200) { // this happens if the thing has been motified
-    		if (uint(resp.ContentLength) > maxObjSize) {
-    			cacheLock.Lock()
-    			cacheList.Remove(val)
-    			delete(cacheMap, urlString)
-    			cacheLock.Unlock()
-    			statLock.Lock()
-    			cacheEvictions++
-    			statLock.Unlock()
-    		} else {
-    			//modify node in list using hashtable
-    			cacheLock.Lock()
-    			cacheMap[urlString].Value.(*node).response = resp
-    			//modify time
-    			cacheMap[urlString].Value.(*node).cacheTime = currTime
-    			cacheLock.Unlock()
-    			statLock.Lock()
-    			if (int(resp.ContentLength) != -1) {
-    				downloadVolume += int(resp.ContentLength)
-    			}
-    			statLock.Unlock()
-    			//move to front of list
-    			cacheLock.Lock()
-    			cacheList.MoveToFront(cacheMap[urlString])
-    			cacheLock.Unlock()
-    		}
-    	} else if (resp.StatusCode == 304) {
-    		cacheLock.Lock()
-    		// modify time
-    		cacheMap[urlString].Value.(*node).cacheTime = currTime
-    		//move to front of list
-    		cacheList.MoveToFront(cacheMap[urlString])
-    		cacheLock.Unlock()
-    		statLock.Lock()
-    		cacheHits++
-    		statLock.Unlock()
-    		<-channels
-    		return
-    	}
+		if stringInArray("no-cache", cacheControlArray) {
+			// remove node from list, hashtable
+			cacheLock.Lock()
+			cacheList.Remove(val)
+			delete(cacheMap, urlString)
+			cacheLock.Unlock()
+			proxyStats.lock.Lock()
+			proxyStats.cacheEvictions++
+			proxyStats.lock.Unlock()
+		} else if resp.StatusCode == 200 { // this happens if the thing has been motified
+			if uint(resp.ContentLength) > maxObjSize {
+				cacheLock.Lock()
+				cacheList.Remove(val)
+				delete(cacheMap, urlString)
+				cacheLock.Unlock()
+				proxyStats.lock.Lock()
+				proxyStats.cacheEvictions++
+				proxyStats.lock.Unlock()
+			} else {
+				//modify node in list using hashtable
+				cacheLock.Lock()
+				cacheMap[urlString].Value.(*node).response = resp
+				//modify time
+				cacheMap[urlString].Value.(*node).cacheTime = currTime
+				cacheLock.Unlock()
+				proxyStats.lock.Lock()
+				if int(resp.ContentLength) != -1 {
+					proxyStats.downloadVolume += int(resp.ContentLength)
+				}
+				proxyStats.lock.Unlock()
+				//move to front of list
+				cacheLock.Lock()
+				cacheList.MoveToFront(cacheMap[urlString])
+				cacheLock.Unlock()
+			}
+		} else if resp.StatusCode == 304 {
+			cacheLock.Lock()
+			// modify time
+			cacheMap[urlString].Value.(*node).cacheTime = currTime
+			//move to front of list
+			cacheList.MoveToFront(cacheMap[urlString])
+			cacheLock.Unlock()
+			proxyStats.lock.Lock()
+			proxyStats.cacheHits++
+			proxyStats.lock.Unlock()
+			<-channels
+			return
+		}
 	} else {
 		cacheControlKey := http.CanonicalHeaderKey("Cache-Control")
 		cacheControlArray := header[cacheControlKey]
 
-    	if (!stringInArray("no-cache", cacheControlArray) && uint(resp.ContentLength) < maxObjSize && resp.StatusCode == 200) {
-    		//insert into hashtable, list
+		if !stringInArray("no-cache", cacheControlArray) && uint(resp.ContentLength) < maxObjSize && resp.StatusCode == 200 {
+			//insert into hashtable, list
 			newNode := node{url: urlString, response: resp, cacheTime: currTime}
 			fmt.Println("inserting")
 			cacheLock.Lock()
 			newElement := cacheList.PushFront(&newNode)
 			cacheMap[urlString] = newElement
 			cacheLock.Unlock()
-			statLock.Lock()
-			if (int(resp.ContentLength) != -1) {
-				downloadVolume += int(resp.ContentLength)
+			proxyStats.lock.Lock()
+			if int(resp.ContentLength) != -1 {
+				proxyStats.downloadVolume += int(resp.ContentLength)
 			}
-			statLock.Unlock()
+			proxyStats.lock.Unlock()
 			// update the size of the cache
 			cacheLock.Lock()
 			cacheSize = cacheSize + uint(resp.ContentLength)
 			cacheLock.Unlock()
-    	}
-    }
-   
-    //evict using LRU
-    for (cacheSize > maxCacheSize) {
-    	// remove from list
-    	// remove from hashtable
-    	cacheLock.Lock()
-    	removal := cacheList.Back().Value.(*node)
-    	removalUrl := removal.url
-    	cacheList.Remove(cacheList.Back())
-    	delete(cacheMap, removalUrl)
-    	cacheSize = cacheSize - uint(removal.response.ContentLength)
-    	cacheLock.Unlock()
-    	statLock.Lock()
-    	cacheEvictions++
-    	statLock.Unlock()
-    }
-    statLock.Lock()
-    cacheMisses++
-    statLock.Unlock()
-    <-channels
+		}
+	}
+
+	//evict using LRU
+	for cacheSize > maxCacheSize {
+		// remove from list
+		// remove from hashtable
+		cacheLock.Lock()
+		removal := cacheList.Back().Value.(*node)
+		removalURL := removal.url
+		cacheList.Remove(cacheList.Back())
+		delete(cacheMap, removalURL)
+		cacheSize = cacheSize - uint(removal.response.ContentLength)
+		cacheLock.Unlock()
+		proxyStats.lock.Lock()
+		proxyStats.cacheEvictions++
+		proxyStats.lock.Unlock()
+	}
+	proxyStats.lock.Lock()
+	proxyStats.cacheMisses++
+	proxyStats.lock.Unlock()
+	<-channels
 }
 
-func doLinkPrefetching (doc *html.Node, host string) {
+func doLinkPrefetching(doc *html.Node, host string) {
 	urls := parse(doc)
 	fmt.Println(len(urls))
 	channels := make(chan bool, maxConcurrency)
 	for _, url := range urls {
-	   channels <- true
+		channels <- true
 
-	   go handleUrl(url, host, channels)
+		go handleUrl(url, host, channels)
 	}
 }
 
-func doDnsPrefetching (doc *html.Node, host string) {
+func doDnsPrefetching(doc *html.Node, host string) {
 	urls := parse(doc)
 
 	for _, url := range urls {
 		fmt.Println(url)
-		if (strings.Contains(url, "http://")) {
+		if strings.Contains(url, "http://") {
 			hostStr := getHost(url)
 			_, err := net.LookupHost(hostStr)
 			if err != nil {
@@ -385,75 +384,78 @@ func handleRequest(w net.Conn) {
 	reader := bufio.NewReader(w)
 	req, err := http.ReadRequest(reader)
 	if err != nil {
-     	fmt.Println("Error in request")
+		fmt.Printf("Error in request: %v", err)
 		fmt.Fprintf(w, Server_Message)
 		return
-    }
-    statLock.Lock()
-    clientRequests++
-    statLock.Unlock()
+	}
+	proxyStats.lock.Lock()
+	proxyStats.clientRequests++
+	proxyStats.lock.Unlock()
 
-    method := req.Method
-    url := req.URL
-    urlString := url.String()
-    if (!strings.HasSuffix(urlString, "/")) {
-    	urlString += "/"
-    }
-    header := req.Header
-    var portNum string
+	method := req.Method
+	url := req.URL
+	urlString := url.String()
+	if !strings.HasSuffix(urlString, "/") {
+		urlString += "/"
+	}
+	header := req.Header
+	var portNum string
 
-    host := req.Host
-    if !strings.Contains(host, ":") {
-       portNum = ":80"
-    }
-    if strings.Contains(host, ":") {
-       portNum = ""
-    }
-    if method != "GET" {
-       fmt.Println("not GET")
-       fmt.Fprintf(w, Server_Message) 
-       return
-    }
-    if (strings.Contains(urlString, "https://") || strings.Contains(urlString, "ftp://")) {
-    	fmt.Fprintf(w, Server_Message)
-    	return
-    }
-   
-    if (caching) {
-    	if val, ok := cacheMap[urlString]; ok {
-    		currentTime := time.Now()
-    		diff := currentTime.Sub(val.Value.(*node).cacheTime)
-    		if (uint(diff.Seconds()) < cacheTimeout) {
-    			//move node to front of list
-    			cacheLock.Lock()
-    			cacheList.MoveToFront(val)
-    			cacheLock.Unlock()
-	    		//send what is in the body
-	    		cacheResponse := val.Value.(*node).response
-	    		defer cacheResponse.Body.Close()
-				
+	host := req.Host
+	if !strings.Contains(host, ":") {
+		portNum = ":80"
+	} else {
+		portNum = ""
+	}
+	fmt.Println(method)
+	fmt.Println(urlString)
+	if method != "GET" {
+		fmt.Printf("not GET method requested: %s", method)
+		fmt.Fprintf(w, Server_Message)
+		return
+	}
+
+	// does not support https or ftp
+	// esentially this proxy only supports http requests
+	if strings.Contains(urlString, "https://") || strings.Contains(urlString, "ftp://") {
+		fmt.Fprintf(w, Server_Message)
+		return
+	}
+
+	if caching {
+		if val, ok := cacheMap[urlString]; ok {
+			currentTime := time.Now()
+			diff := currentTime.Sub(val.Value.(*node).cacheTime)
+			if uint(diff.Seconds()) < cacheTimeout {
+				//move node to front of list
+				cacheLock.Lock()
+				cacheList.MoveToFront(val)
+				cacheLock.Unlock()
+				//send what is in the body
+				cacheResponse := val.Value.(*node).response
+				defer cacheResponse.Body.Close()
+
 				var newReader io.Reader
 				cacheLock.Lock()
 
 				bodyBytes, err := ioutil.ReadAll(cacheResponse.Body)
 				if err != nil {
-	    			fmt.Printf("readAll1 error: %s\n", err)
-	    		}
+					fmt.Printf("readAll1 error: %s\n", err)
+				}
 				cacheMap[urlString].Value.(*node).response.Body = ioutil.NopCloser(bytes.NewBuffer(bodyBytes))
 				cacheLock.Unlock()
 				tempReader := bytes.NewReader(bodyBytes)
 				cacheResponse.Write(w)
 
-
 				fmt.Println("returning from cache")
 				fmt.Println(len(bodyBytes))
-				statLock.Lock()
-				cacheHits++
-				if (int(cacheResponse.ContentLength) != -1) {
-					trafficSent += int(cacheResponse.ContentLength)
-					volumeFromCache += int(cacheResponse.ContentLength)
+				proxyStats.lock.Lock()
+				proxyStats.cacheHits++
+				if int(cacheResponse.ContentLength) != -1 {
+					proxyStats.trafficSent += int(cacheResponse.ContentLength)
+					proxyStats.volumeFromCache += int(cacheResponse.ContentLength)
 				}
-				statLock.Unlock()
+				proxyStats.lock.Unlock()
 				cacheLock.Lock()
 				cacheMap[urlString].Value.(*node).response.Body = ioutil.NopCloser(bytes.NewBuffer(bodyBytes))
 				cacheLock.Unlock()
@@ -462,10 +464,10 @@ func handleRequest(w net.Conn) {
 				encodingKey := http.CanonicalHeaderKey("Content-Encoding")
 				encodingArray := cacheResponse.Header[encodingKey]
 
-				if (stringInArray("gzip", encodingArray)) {
+				if stringInArray("gzip", encodingArray) {
 					newReader, err = gzip.NewReader(tempReader)
-			    	if err != nil {
-						fmt.Println(err) 
+					if err != nil {
+						fmt.Println(err)
 						return
 					}
 				} else {
@@ -473,167 +475,165 @@ func handleRequest(w net.Conn) {
 				}
 
 				doc, err := html.Parse(newReader)
-				if err != nil { 
+				if err != nil {
 					return
 				}
 				if linkPrefetching {
 					go doLinkPrefetching(doc, host)
 				} else if dnsPrefetching {
-					go doDnsPrefetching(doc, host) 
+					go doDnsPrefetching(doc, host)
 				}
-	    		return
-    		} else {
-    			//conditional GET
-	    		//add to header If-Modified-Since
-	    		fmt.Println("calling conditional GET")
-	    		modifiedTime := val.Value.(*node).cacheTime.UTC()
-	    		timeString := modifiedTime.Format("Mon, 02 Jan 2006 15:04:05 GMT")
-	    		header.Set("If-Modified-Since", timeString)
-    		}
-    	}
-    }
+				return
+			}
+			//conditional GET
+			//add to header If-Modified-Since
+			fmt.Println("calling conditional GET")
+			modifiedTime := val.Value.(*node).cacheTime.UTC()
+			timeString := modifiedTime.Format("Mon, 02 Jan 2006 15:04:05 GMT")
+			header.Set("If-Modified-Since", timeString)
+		}
+	}
 
-    connDial, err := net.Dial("tcp", host + portNum)
-    if err != nil {
-       fmt.Println("Error in Dial")
-       fmt.Fprintf(w, Server_Message)
-       return
-    }
-    defer connDial.Close()
-    path := url.Path
-    connDial.Write([]byte("GET " + path + " HTTP/1.1\r\n"))
-    header.Set("Host", host)
-    header.Set("Connection", "close")
-    header.Set("Accept-Encoding", "gzip")
-    header.Write(connDial)
-    connDial.Write([]byte("\r\n\r\n"))
-    
-    bufReader := bufio.NewReader(connDial)
-    resp, err := http.ReadResponse(bufReader, req)
-    if err != nil {
-     	fmt.Println("Error in response")
+	connDial, err := net.Dial("tcp", host+portNum)
+	if err != nil {
+		fmt.Println("Error in Dial")
 		fmt.Fprintf(w, Server_Message)
 		return
-    }
-    defer resp.Body.Close()
+	}
+	defer connDial.Close()
+	path := url.Path
+	connDial.Write([]byte("GET " + path + " HTTP/1.1\r\n"))
+	header.Set("Host", host)
+	header.Set("Connection", "close")
+	header.Set("Accept-Encoding", "gzip")
+	header.Write(connDial)
+	connDial.Write([]byte("\r\n\r\n"))
 
-    //response time
-    currTime := time.Now()
-    header = resp.Header
-    contentLength := resp.ContentLength
+	bufReader := bufio.NewReader(connDial)
+	resp, err := http.ReadResponse(bufReader, req)
+	if err != nil {
+		fmt.Println("Error in response")
+		fmt.Fprintf(w, Server_Message)
+		return
+	}
+	defer resp.Body.Close()
 
-    if (caching) {
-	    //currently in cache
-	    if val, ok := cacheMap[urlString]; ok{
-	    	//check header Cache-Control
-	    	cacheControlKey := http.CanonicalHeaderKey("Cache-Control")
+	//response time
+	currTime := time.Now()
+	header = resp.Header
+	contentLength := resp.ContentLength
+
+	if caching {
+		//currently in cache
+		if val, ok := cacheMap[urlString]; ok {
+			//check header Cache-Control
+			cacheControlKey := http.CanonicalHeaderKey("Cache-Control")
 			cacheControlArray := header[cacheControlKey]
 
 			// remove node from list, hashtable
-			if (stringInArray("no-cache", cacheControlArray)) {
-	    		cacheLock.Lock()
-	    		cacheList.Remove(val)
-	    		delete(cacheMap, urlString)
-	    		cacheLock.Unlock()
-	    		statLock.Lock()
-	    		cacheEvictions++
-	    		statLock.Unlock()
-	    	} else if (resp.StatusCode == 200) {   				//the cached object has been modified
-	    		if (uint(resp.ContentLength) > maxObjSize) {
-	    			cacheLock.Lock()
-	    			cacheList.Remove(val)
-	    			delete(cacheMap, urlString)
-	    			cacheLock.Unlock()
-	    			statLock.Lock()
-	    			cacheEvictions++
-	    			statLock.Unlock()
-	    		} else {
-	    			//modify node in list using hashtable
-	    			cacheLock.Lock()
-	    			cacheMap[urlString].Value.(*node).response = resp
-	    			//modify time
-	    			cacheMap[urlString].Value.(*node).cacheTime = currTime
-	    			cacheLock.Unlock()
-	    			statLock.Lock()
-	    			if (int(resp.ContentLength) != -1) {
-	    				downloadVolume += int(resp.ContentLength)
-	    			}
-	    			statLock.Unlock()
-	    			//move to front of list
-	    			cacheLock.Lock()
-	    			cacheList.MoveToFront(val)
-	    			cacheLock.Unlock()
-	    		}
-	    	} else if (resp.StatusCode == 304) {   //the cached object has not been modified
-	    		// modify time
-	    		cacheLock.Lock()
-	    		cacheMap[urlString].Value.(*node).cacheTime = currTime
-	    		//move to front of list
-	    		cacheList.MoveToFront(val)
-	    		cacheLock.Unlock()
-	    		cacheResponse := val.Value.(*node).response
-	    		if (cacheResponse.ContentLength == -1) {
-	    			fmt.Println("fuc")
-	    		}
-	    		defer cacheResponse.Body.Close()
+			if stringInArray("no-cache", cacheControlArray) {
+				cacheLock.Lock()
+				cacheList.Remove(val)
+				delete(cacheMap, urlString)
+				cacheLock.Unlock()
+				proxyStats.lock.Lock()
+				proxyStats.cacheEvictions++
+				proxyStats.lock.Unlock()
+			} else if resp.StatusCode == 200 { //the cached object has been modified
+				if uint(resp.ContentLength) > maxObjSize {
+					cacheLock.Lock()
+					cacheList.Remove(val)
+					delete(cacheMap, urlString)
+					cacheLock.Unlock()
+					proxyStats.lock.Lock()
+					proxyStats.cacheEvictions++
+					proxyStats.lock.Unlock()
+				} else {
+					//modify node in list using hashtable
+					cacheLock.Lock()
+					cacheMap[urlString].Value.(*node).response = resp
+					//modify time
+					cacheMap[urlString].Value.(*node).cacheTime = currTime
+					cacheLock.Unlock()
+					proxyStats.lock.Lock()
+					if int(resp.ContentLength) != -1 {
+						proxyStats.downloadVolume += int(resp.ContentLength)
+					}
+					proxyStats.lock.Unlock()
+					//move to front of list
+					cacheLock.Lock()
+					cacheList.MoveToFront(val)
+					cacheLock.Unlock()
+				}
+			} else if resp.StatusCode == 304 { //the cached object has not been modified
+				// modify time
+				cacheLock.Lock()
+				cacheMap[urlString].Value.(*node).cacheTime = currTime
+				//move to front of list
+				cacheList.MoveToFront(val)
+				cacheLock.Unlock()
+				cacheResponse := val.Value.(*node).response
+				if cacheResponse.ContentLength == -1 {
+					fmt.Println("fuc")
+				}
+				defer cacheResponse.Body.Close()
 
-	    		var newReader io.Reader
-	    		cacheLock.Lock()
-	    		bodyBytes, err := ioutil.ReadAll(cacheResponse.Body)
-	    		if err != nil {
-	    			fmt.Printf("readAll2 error: %s\n", err)
-	    		}
+				var newReader io.Reader
+				cacheLock.Lock()
+				bodyBytes, err := ioutil.ReadAll(cacheResponse.Body)
+				if err != nil {
+					fmt.Printf("readAll2 error: %s\n", err)
+				}
 				cacheMap[urlString].Value.(*node).response.Body = ioutil.NopCloser(bytes.NewBuffer(bodyBytes))
 				cacheLock.Unlock()
 				tempReader := bytes.NewReader(bodyBytes)
 
-
 				fmt.Println("it's in the cache and has not been modified")
-	    		cacheResponse.Write(w)
+				cacheResponse.Write(w)
 
-	    		statLock.Lock()
-	    		cacheHits++
-	    		if (int(cacheResponse.ContentLength) != -1) {
-		    		trafficSent += int(cacheResponse.ContentLength)
-		    		volumeFromCache += int(cacheResponse.ContentLength)
-		    	}
-	    		statLock.Unlock()
-	    		cacheLock.Lock()
-	    		cacheMap[urlString].Value.(*node).response.Body = ioutil.NopCloser(bytes.NewBuffer(bodyBytes))
-	    		cacheLock.Unlock()
+				proxyStats.lock.Lock()
+				proxyStats.cacheHits++
+				if int(cacheResponse.ContentLength) != -1 {
+					proxyStats.trafficSent += int(cacheResponse.ContentLength)
+					proxyStats.volumeFromCache += int(cacheResponse.ContentLength)
+				}
+				proxyStats.lock.Unlock()
+				cacheLock.Lock()
+				cacheMap[urlString].Value.(*node).response.Body = ioutil.NopCloser(bytes.NewBuffer(bodyBytes))
+				cacheLock.Unlock()
 
-	    		encodingKey := http.CanonicalHeaderKey("Content-Encoding")
+				encodingKey := http.CanonicalHeaderKey("Content-Encoding")
 				encodingArray := cacheResponse.Header[encodingKey]
 
-				if (stringInArray("gzip", encodingArray)) {
+				if stringInArray("gzip", encodingArray) {
 					newReader, err = gzip.NewReader(tempReader)
-			    	if err != nil {
-						fmt.Println(err) 
+					if err != nil {
+						fmt.Println(err)
 						return
-					}	
+					}
 				} else {
 					newReader = tempReader
 				}
 
 				doc, err := html.Parse(newReader)
-				if err != nil { 
+				if err != nil {
 					return
 				}
 
 				if linkPrefetching {
 					go doLinkPrefetching(doc, host)
 				} else if dnsPrefetching {
-					go doDnsPrefetching(doc, host) 
+					go doDnsPrefetching(doc, host)
 				}
-	    		return
-	    	}
-	    	
-    	} else {
-    		cacheControlKey := http.CanonicalHeaderKey("Cache-Control")
+				return
+			}
+
+		} else {
+			cacheControlKey := http.CanonicalHeaderKey("Cache-Control")
 			cacheControlArray := header[cacheControlKey]
 
-	    	if (!stringInArray("no-cache", cacheControlArray) && uint(contentLength) < maxObjSize && resp.StatusCode == 200) {
-	    		//insert into hashtable, list
+			if !stringInArray("no-cache", cacheControlArray) && uint(contentLength) < maxObjSize && resp.StatusCode == 200 {
+				//insert into hashtable, list
 				fmt.Println("caching in")
 				newNode := node{url: urlString, response: resp, cacheTime: currTime}
 				cacheLock.Lock()
@@ -641,53 +641,53 @@ func handleRequest(w net.Conn) {
 				cacheMap[urlString] = newElement
 				cacheLock.Unlock()
 				// update the size of the cache
-				statLock.Lock()
-				if (int(resp.ContentLength) != -1) {
-					downloadVolume += int(resp.ContentLength)
+				proxyStats.lock.Lock()
+				if int(resp.ContentLength) != -1 {
+					proxyStats.downloadVolume += int(resp.ContentLength)
 				}
-				statLock.Unlock()
+				proxyStats.lock.Unlock()
 				cacheLock.Lock()
 				cacheSize = cacheSize + uint(contentLength)
 				cacheLock.Unlock()
-	    	}
-	    }
-	    //evict using LRU
-	    for (cacheSize > maxCacheSize) {
-	    	// remove from list
-	    	// remove from hashtable
-	    	cacheLock.Lock()
-	    	removal := cacheList.Back().Value.(*node)
-	    	removalUrl := removal.url
-	    	cacheList.Remove(cacheList.Back())
-	    	delete(cacheMap, removalUrl)
-	    	cacheSize = cacheSize - uint(removal.response.ContentLength)
-	    	cacheLock.Unlock()
-	    	statLock.Lock()
-	    	cacheEvictions++
-	    	statLock.Unlock()
-	    }
-    }
-    cacheLock.Lock()
-    if (resp.ContentLength == -1) {
-	    			fmt.Println("error in content length")
-	    		}
-    bodyBytes, err := ioutil.ReadAll(resp.Body)
-    if err != nil {
-	    fmt.Printf("readAll3 error: %s\n", err)
+			}
+		}
+		//evict using LRU
+		for cacheSize > maxCacheSize {
+			// remove from list
+			// remove from hashtable
+			cacheLock.Lock()
+			removal := cacheList.Back().Value.(*node)
+			removalURL := removal.url
+			cacheList.Remove(cacheList.Back())
+			delete(cacheMap, removalURL)
+			cacheSize = cacheSize - uint(removal.response.ContentLength)
+			cacheLock.Unlock()
+			proxyStats.lock.Lock()
+			proxyStats.cacheEvictions++
+			proxyStats.lock.Unlock()
+		}
+	}
+	cacheLock.Lock()
+	if resp.ContentLength == -1 {
+		fmt.Println("error in content length")
+	}
+	bodyBytes, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		fmt.Printf("readAll3 error: %s\n", err)
 	}
 	resp.Body = ioutil.NopCloser(bytes.NewBuffer(bodyBytes))
 	cacheLock.Unlock()
 
 	resp.Write(w)
 	fmt.Println("writing to client")
-	statLock.Lock()
-	cacheMisses++
-	if (resp.ContentLength != -1) {
-		trafficSent += int(resp.ContentLength)
+	proxyStats.lock.Lock()
+	proxyStats.cacheMisses++
+	if resp.ContentLength != -1 {
+		proxyStats.trafficSent += int(resp.ContentLength)
 	}
-	statLock.Unlock()
+	proxyStats.lock.Unlock()
 	cacheLock.Lock()
-	if (caching) {
+	if caching {
 		if _, ok := cacheMap[urlString]; ok {
 			cacheMap[urlString].Value.(*node).response.Body = ioutil.NopCloser(bytes.NewBuffer(bodyBytes))
 		}
@@ -700,18 +700,18 @@ func handleRequest(w net.Conn) {
 		encodingKey := http.CanonicalHeaderKey("Content-Encoding")
 		encodingArray := header[encodingKey]
 
-		if (stringInArray("gzip", encodingArray)) {
+		if stringInArray("gzip", encodingArray) {
 			newReader, err = gzip.NewReader(tempReader)
 			if err != nil {
-				fmt.Println(err) 
+				fmt.Println(err)
 				return
-			}	
+			}
 		} else {
 			newReader = tempReader
 		}
 
 		doc, err := html.Parse(newReader)
-		if err != nil { 
+		if err != nil {
 			fmt.Println(err)
 			return
 		}
@@ -719,7 +719,7 @@ func handleRequest(w net.Conn) {
 		if linkPrefetching {
 			go doLinkPrefetching(doc, host)
 		} else if dnsPrefetching {
-			go doDnsPrefetching(doc, host) 
+			go doDnsPrefetching(doc, host)
 		}
 	}
 }
@@ -740,32 +740,35 @@ func initFlags() {
 func main() {
 	initFlags()
 
-	go saveStatistics()
-	ln, er := net.Listen("tcp", "0.0.0.0:" + strconv.Itoa(int(listeningPort)))
-	if er != nil {
-       fmt.Println("Error in Listen")
-       return
-    }
-
-    defer ln.Close()
-
-    if (linkPrefetching) {
-    	caching = true
+	proxyStats = stats{
+		lock: &sync.RWMutex{},
 	}
-    if (caching) {
-    	// doubly-linked list and Map for the LRU cache data-structure
-    	cacheMap = make(map[string]*list.Element)
-    	cacheList = list.New()
-    	cacheSize = 0
-    }
-    statLock = &sync.RWMutex{}
-    cacheLock = &sync.Mutex{}
+	cacheLock = &sync.Mutex{}
+	go saveStatistics()
+	ln, er := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%s", strconv.Itoa(int(listeningPort))))
+	if er != nil {
+		fmt.Println("Error in Listen")
+		return
+	}
+
+	defer ln.Close()
+
+	if linkPrefetching {
+		caching = true
+	}
+	if caching {
+		// doubly-linked list and Map for the LRU cache data-structure
+		cacheMap = make(map[string]*list.Element)
+		cacheList = list.New()
+		cacheSize = 0
+	}
 
 	for {
+		// This is blocking.
 		conn, error := ln.Accept()
-	   	if error != nil {
-	       fmt.Println("Error in Accept")
-  	    }
-        go handleRequest(conn)
-    }
+		if error != nil {
+			fmt.Println("Error in Accept")
+		}
+		go handleRequest(conn)
+	}
 }
